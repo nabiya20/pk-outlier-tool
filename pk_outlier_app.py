@@ -295,7 +295,7 @@ if df.empty:
 # ========================================================================
 
 st.header("2. Analysis")
-tab_outlier, tab_ttest = st.tabs(["🔍 Outlier Detection", "📊 T-Test Comparison"])
+tab_outlier, tab_ttest, tab_profile = st.tabs(["🔍 Outlier Detection", "📊 T-Test Comparison", "📉 PK Profile Plot"])
 
 # ------------------------------------------------------------------------
 # TAB 1: Outlier detection
@@ -481,3 +481,134 @@ with tab_ttest:
                 res_df["significant"] = res_df["significant"].map({True: "Yes (p<0.05)", False: "No", None: "n<2, skipped"})
                 st.dataframe(res_df.style.format({"mean1": "{:.3g}", "mean2": "{:.3g}", "t_stat": "{:.3g}", "p_value": "{:.4f}"}),
                              use_container_width=True)
+
+# ------------------------------------------------------------------------
+# TAB 3: PK Profile Plot (publication-style)
+# ------------------------------------------------------------------------
+with tab_profile:
+    st.subheader("Create a publication-style PK profile plot")
+
+    st.markdown("**Step 1 — choose which groups & subjects to plot**")
+    profile_groups = st.multiselect("Groups to include", all_groups, default=all_groups, key="profile_groups")
+    if not profile_groups:
+        st.warning("Select at least one group.")
+        st.stop()
+
+    profile_df = df[df[group_col].isin(profile_groups)]
+    profile_subjects = sorted(profile_df[subj_col].unique().tolist())
+    excluded_profile_subjects = st.multiselect(
+        "Subjects to exclude from this plot only", profile_subjects, default=[], key="profile_exclude_subj"
+    )
+    profile_df = profile_df[~profile_df[subj_col].isin(excluded_profile_subjects)]
+
+    st.markdown("**Step 2 — group labels & colors**")
+    default_palette = ["#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#17becf",
+                        "#d62728", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22"]
+    rename_map, color_map_profile = {}, {}
+    for i, g in enumerate(profile_groups):
+        with st.expander(f"Customize '{g}'", expanded=False):
+            rename_map[g] = st.text_input("Display label (shown in legend)", value=g, key=f"label_{g}")
+            color_map_profile[g] = st.color_picker("Line/marker color", value=default_palette[i % len(default_palette)], key=f"color_{g}")
+
+    st.markdown("**Step 3 — titles, axes & error bars**")
+    tc1, tc2, tc3 = st.columns(3)
+    with tc1:
+        plot_title = st.text_input("Plot title", value="PK Profile")
+    with tc2:
+        x_axis_title = st.text_input("X-axis title", value=str(time_col))
+    with tc3:
+        y_axis_title = st.text_input("Y-axis title", value=f"{conc_col} (ng/mL)")
+
+    ac1, ac2, ac3 = st.columns(3)
+    with ac1:
+        x_ticks_input = st.text_input("X-axis tick values (comma-separated, optional)", value="",
+                                       placeholder="e.g. 0,7,14,21,28,35,42")
+    with ac2:
+        y_interval_linear = st.number_input("Y-axis interval — linear plot only (0 = auto)", min_value=0.0, value=0.0)
+    with ac3:
+        error_metric = st.radio("Error bars", ["SD", "SEM", "None"], horizontal=True)
+
+    st.markdown("**Step 4 — MEC line (optional)**")
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        include_mec = st.checkbox("Include MEC line")
+    mec_value, mec_label = None, "MEC"
+    if include_mec:
+        with mc2:
+            mec_value = st.number_input("MEC value (ng/mL)", min_value=0.0, value=10.0)
+        with mc3:
+            mec_label = st.text_input("MEC line label", value="MEC")
+
+    if profile_df.empty:
+        st.warning("No data left after filtering — adjust the group/subject selections above.")
+        st.stop()
+
+    summary = (
+        profile_df.groupby([group_col, time_col])[conc_col]
+        .agg(mean="mean", sd="std", sem="sem", n="count")
+        .reset_index()
+    )
+
+    x_ticks = None
+    if x_ticks_input.strip():
+        try:
+            x_ticks = [float(x.strip()) for x in x_ticks_input.split(",") if x.strip() != ""]
+        except ValueError:
+            st.warning("Couldn't parse X-axis tick values — using automatic ticks instead.")
+            x_ticks = None
+
+    def build_profile_figure(log_y: bool):
+        fig = go.Figure()
+        for g in profile_groups:
+            g_data = summary[summary[group_col] == g].sort_values(time_col)
+            err = None
+            if error_metric == "SD":
+                err = g_data["sd"].fillna(0)
+            elif error_metric == "SEM":
+                err = g_data["sem"].fillna(0)
+            fig.add_trace(go.Scatter(
+                x=g_data[time_col], y=g_data["mean"],
+                mode="lines+markers",
+                name=rename_map.get(g, g),
+                line=dict(color=color_map_profile.get(g), width=2.5),
+                marker=dict(size=8, color=color_map_profile.get(g)),
+                error_y=dict(type="data", array=err, visible=True) if err is not None else None,
+            ))
+
+        if include_mec and mec_value is not None:
+            fig.add_hline(y=mec_value, line_dash="dash", line_color="black",
+                          annotation_text=mec_label, annotation_position="top left")
+
+        fig.update_layout(
+            title=dict(text=plot_title, x=0.5, xanchor="center", font=dict(size=20, family="Arial", color="black")),
+            xaxis_title=x_axis_title,
+            yaxis_title=y_axis_title,
+            template="simple_white",
+            font=dict(family="Arial", size=14, color="black"),
+            legend=dict(bordercolor="lightgray", borderwidth=1, x=1.02, y=1, xanchor="left"),
+            height=550,
+            margin=dict(t=80, r=190),
+        )
+        if x_ticks:
+            fig.update_xaxes(tickmode="array", tickvals=x_ticks)
+        fig.update_xaxes(showline=True, linewidth=1, linecolor="black", mirror=True, gridcolor="lightgray")
+        if log_y:
+            fig.update_yaxes(type="log", showline=True, linewidth=1, linecolor="black", mirror=True, gridcolor="lightgray")
+        else:
+            fig.update_yaxes(showline=True, linewidth=1, linecolor="black", mirror=True, gridcolor="lightgray")
+            if y_interval_linear > 0:
+                fig.update_yaxes(dtick=y_interval_linear)
+        return fig
+
+    st.markdown("### Linear scale")
+    fig_linear = build_profile_figure(log_y=False)
+    st.plotly_chart(fig_linear, use_container_width=True)
+
+    st.markdown("### Semi-log scale")
+    fig_log = build_profile_figure(log_y=True)
+    st.plotly_chart(fig_log, use_container_width=True)
+
+    st.caption(
+        "Tip: hover over a plot and click the camera icon in its top-right toolbar to download it "
+        "as a high-resolution PNG for slides or reports."
+    )
