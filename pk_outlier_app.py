@@ -5,8 +5,13 @@ A Streamlit app for:
   1) Outlier detection on Group / Subject / Time / Concentration PK data
      using IQR, Z-score, Modified Z-score, or Grubbs' test.
   2) T-test comparison between groups, on either the raw time-concentration
-     data (per time point) or on derived PK parameters (Cmax, Tmax, AUClast),
-     with the ability to include/exclude specific groups or subjects.
+     data (per time point) or on PK parameters (Cmax, AUC, custom partial
+     AUCs, etc.), with the ability to include/exclude specific groups/subjects.
+
+Data entry is done via editable, spreadsheet-like grids: you can type directly,
+or copy cells from Excel and paste them in (click the top-left cell of the grid,
+then Ctrl+V / Cmd+V). File upload is also available if you'd rather import a
+whole file at once.
 
 Run with:
     streamlit run pk_outlier_app.py
@@ -94,18 +99,12 @@ MIN_N = {"IQR": 4, "Z-score": 3, "Modified Z-score": 3, "Grubbs' test": 3}
 
 
 def run_outlier_detection(df, group_cols, value_col, method, params):
-    """
-    group_cols: list of columns defining the comparison subset
-                (e.g. [] for overall, [time_col], or [group_col, time_col]).
-    Returns df with added columns: Is_Outlier, Score, Detail, N_in_subset
-    """
     out_rows = []
     grouping = df.groupby(group_cols) if group_cols else [(None, df)]
     for _, sub in grouping:
         vals = sub[value_col]
         n = vals.notna().sum()
         g = sub.copy()
-        score = pd.Series(np.nan, index=sub.index)
 
         if n < MIN_N[method]:
             g["Is_Outlier"] = False
@@ -129,10 +128,6 @@ def run_outlier_detection(df, group_cols, value_col, method, params):
     return pd.concat(out_rows, ignore_index=True)
 
 
-# ========================================================================
-# PK parameter helpers (for the PK-parameter t-test)
-# ========================================================================
-
 def linear_trapz_auc(time_vals, conc_vals):
     """Manual linear trapezoidal AUC (avoids relying on np.trapz/np.trapezoid,
     whose availability differs across numpy versions)."""
@@ -141,20 +136,6 @@ def linear_trapz_auc(time_vals, conc_vals):
     if len(t) < 2:
         return np.nan
     return float(np.sum((t[1:] - t[:-1]) * (c[1:] + c[:-1]) / 2.0))
-
-
-def compute_pk_params(df, group_col, subj_col, time_col, conc_col):
-    """Per-subject Cmax, Tmax, AUClast (linear trapezoidal) from time-concentration data."""
-    rows = []
-    for (grp, subj), g in df.groupby([group_col, subj_col]):
-        g = g.sort_values(time_col).dropna(subset=[time_col, conc_col])
-        if g.empty:
-            continue
-        cmax = g[conc_col].max()
-        tmax = g.loc[g[conc_col].idxmax(), time_col]
-        auc_last = linear_trapz_auc(g[time_col].values, g[conc_col].values)
-        rows.append({group_col: grp, subj_col: subj, "Cmax": cmax, "Tmax": tmax, "AUClast": auc_last})
-    return pd.DataFrame(rows)
 
 
 def two_sample_ttest(a, b, equal_var=False):
@@ -169,75 +150,159 @@ def two_sample_ttest(a, b, equal_var=False):
 
 
 # ========================================================================
-# Sidebar: data loading & column mapping
+# Demo / template data
 # ========================================================================
 
-st.title("🧪 PK Outlier & Group Comparison Tool")
-st.caption("Outlier detection (IQR / Z-score / Modified Z-score / Grubbs) and group t-test comparisons for PK study data")
-
-st.sidebar.header("1. Load your data")
-uploaded_file = st.sidebar.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx", "xls"])
-use_demo = st.sidebar.checkbox("Use demo data instead", value=uploaded_file is None)
-
-if uploaded_file is not None:
-    raw_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
-elif use_demo:
+def make_demo_tc_data():
     rng = np.random.default_rng(42)
     groups = {"Reference": 90, "Test1": 100, "Test2": 110, "Test3": 95}
     timepoints = [0, 0.5, 1, 2, 4, 8, 12, 24]
     rows = []
     for grp, base_dose in groups.items():
-        for i in range(1, 7):
+        for i in range(1, 5):
             subj = f"{grp}_S{i:02d}"
             base = rng.uniform(0.85, 1.15) * base_dose
             for t in timepoints:
                 conc = base * np.exp(-0.15 * t) + rng.normal(0, 2)
-                rows.append({"Group": grp, "Subject": subj, "Time": t, "Concentration": max(conc, 0)})
+                rows.append({"Group": grp, "Subject": subj, "Time": t, "Concentration": round(max(conc, 0), 2)})
     rows.append({"Group": "Test1", "Subject": "Test1_S99_outlier", "Time": 4, "Concentration": 300})
-    rows.append({"Group": "Reference", "Subject": "Reference_S98_outlier", "Time": 12, "Concentration": 1})
-    raw_df = pd.DataFrame(rows)
-else:
-    st.info("Upload a file or check 'Use demo data' in the sidebar to get started.")
+    return pd.DataFrame(rows)
+
+
+def make_demo_pk_data():
+    return pd.DataFrame([
+        {"Group": "Reference", "Subject": "Reference_S01", "Cmax": 88.2, "AUC": 610.4, "AUC_partial": 210.1},
+        {"Group": "Reference", "Subject": "Reference_S02", "Cmax": 91.5, "AUC": 630.2, "AUC_partial": 215.6},
+        {"Group": "Test1", "Subject": "Test1_S01", "Cmax": 99.1, "AUC": 700.8, "AUC_partial": 240.3},
+        {"Group": "Test1", "Subject": "Test1_S02", "Cmax": 102.4, "AUC": 715.0, "AUC_partial": 245.9},
+    ])
+
+
+# ========================================================================
+# Session state init
+# ========================================================================
+
+if "tc_data" not in st.session_state:
+    st.session_state.tc_data = make_demo_tc_data()
+if "pk_data" not in st.session_state:
+    st.session_state.pk_data = make_demo_pk_data()
+
+st.title("🧪 PK Outlier & Group Comparison Tool")
+st.caption("Paste your data directly into the grids below (like Excel), or upload a file if you prefer.")
+
+# ========================================================================
+# Data entry
+# ========================================================================
+
+st.header("1. Enter your data")
+entry_tab_tc, entry_tab_pk = st.tabs(["📈 Time–Concentration data", "🧮 PK Parameter data"])
+
+with entry_tab_tc:
+    st.markdown(
+        "Columns: **Group, Subject, Time, Concentration**. "
+        "Click the top-left cell and paste (Ctrl+V / Cmd+V) to bring in data copied from Excel. "
+        "Right-click a row for more options, or use the `+` at the bottom to add rows."
+    )
+    up_tc = st.file_uploader("...or upload a CSV/Excel file to replace this table", type=["csv", "xlsx", "xls"], key="up_tc")
+    if up_tc is not None:
+        st.session_state.tc_data = pd.read_csv(up_tc) if up_tc.name.endswith(".csv") else pd.read_excel(up_tc)
+
+    st.session_state.tc_data = st.data_editor(
+        st.session_state.tc_data,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="tc_editor",
+        column_config={
+            "Group": st.column_config.TextColumn(required=True),
+            "Subject": st.column_config.TextColumn(required=True),
+            "Time": st.column_config.NumberColumn(required=True),
+            "Concentration": st.column_config.NumberColumn(required=True),
+        },
+    )
+    if st.button("Reset to demo data", key="reset_tc"):
+        st.session_state.tc_data = make_demo_tc_data()
+        st.rerun()
+
+with entry_tab_pk:
+    st.markdown(
+        "Default columns: **Group, Subject, Cmax, AUC, AUC_partial**. "
+        "Add your own parameter columns below (e.g. AUC_0-12, Tmax, t1/2, CL/F) — "
+        "the sheet is fully adjustable."
+    )
+    up_pk = st.file_uploader("...or upload a CSV/Excel file to replace this table", type=["csv", "xlsx", "xls"], key="up_pk")
+    if up_pk is not None:
+        st.session_state.pk_data = pd.read_csv(up_pk) if up_pk.name.endswith(".csv") else pd.read_excel(up_pk)
+
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        new_col_name = st.text_input("New parameter column name (e.g. 'AUC_0-12', 'Tmax', 't_half')", key="new_pk_col")
+    with col_b:
+        st.write("")
+        st.write("")
+        if st.button("➕ Add column") and new_col_name.strip():
+            if new_col_name.strip() not in st.session_state.pk_data.columns:
+                st.session_state.pk_data[new_col_name.strip()] = np.nan
+            st.rerun()
+
+    numeric_cols = [c for c in st.session_state.pk_data.columns if c not in ("Group", "Subject")]
+    cols_to_drop = st.multiselect("Remove parameter column(s)", numeric_cols)
+    if cols_to_drop and st.button("🗑️ Remove selected column(s)"):
+        st.session_state.pk_data = st.session_state.pk_data.drop(columns=cols_to_drop)
+        st.rerun()
+
+    column_config_pk = {
+        "Group": st.column_config.TextColumn(required=True),
+        "Subject": st.column_config.TextColumn(required=True),
+    }
+    for c in st.session_state.pk_data.columns:
+        if c not in ("Group", "Subject"):
+            column_config_pk[c] = st.column_config.NumberColumn()
+
+    st.session_state.pk_data = st.data_editor(
+        st.session_state.pk_data,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="pk_editor",
+        column_config=column_config_pk,
+    )
+    if st.button("Reset to demo data", key="reset_pk"):
+        st.session_state.pk_data = make_demo_pk_data()
+        st.rerun()
+
+# ========================================================================
+# Clean time-concentration data for analysis
+# ========================================================================
+
+group_col, subj_col, time_col, conc_col = "Group", "Subject", "Time", "Concentration"
+
+df = st.session_state.tc_data.copy()
+required_tc_cols = {group_col, subj_col, time_col, conc_col}
+if not required_tc_cols.issubset(df.columns):
+    st.error(f"Time–Concentration sheet must have columns: {', '.join(required_tc_cols)}")
     st.stop()
 
-st.sidebar.header("2. Map your columns")
-columns = list(raw_df.columns)
-
-
-def guess(name, default_idx=0):
-    return columns.index(name) if name in columns else default_idx
-
-
-group_col = st.sidebar.selectbox("Group column", columns, index=guess("Group"))
-subj_col = st.sidebar.selectbox("Subject column", columns, index=guess("Subject"))
-time_col = st.sidebar.selectbox("Time column", columns, index=guess("Time"))
-conc_col = st.sidebar.selectbox("Concentration column", columns, index=guess("Concentration"))
-
-# Clean numeric columns
-df = raw_df.copy()
 df[conc_col] = pd.to_numeric(df[conc_col], errors="coerce")
 df[time_col] = pd.to_numeric(df[time_col], errors="coerce")
-n_dropped = df[[conc_col, time_col]].isna().any(axis=1).sum()
-df = df.dropna(subset=[conc_col, time_col])
-if n_dropped > 0:
-    st.warning(f"Dropped {n_dropped} row(s) with non-numeric or missing Time/Concentration values.")
-
+df = df.dropna(subset=[group_col, subj_col, time_col, conc_col])
 all_groups = sorted(df[group_col].dropna().unique().tolist())
 
+if df.empty:
+    st.warning("No usable rows in the Time–Concentration sheet yet. Add data above to continue.")
+    st.stop()
+
 # ========================================================================
-# Tabs
+# Analysis tabs
 # ========================================================================
 
+st.header("2. Analysis")
 tab_outlier, tab_ttest = st.tabs(["🔍 Outlier Detection", "📊 T-Test Comparison"])
 
 # ------------------------------------------------------------------------
 # TAB 1: Outlier detection
 # ------------------------------------------------------------------------
 with tab_outlier:
-    st.sidebar.header("3. Outlier detection settings")
-    method = st.sidebar.selectbox(
-        "Method", ["IQR", "Z-score", "Modified Z-score", "Grubbs' test"]
-    )
+    st.sidebar.header("Outlier detection settings")
+    method = st.sidebar.selectbox("Method", ["IQR", "Z-score", "Modified Z-score", "Grubbs' test"])
     grouping_choice = st.sidebar.radio(
         "Compare within...",
         ["Group + Time point (recommended)", "Time point only", "Overall (whole dataset)"],
@@ -264,7 +329,7 @@ with tab_outlier:
         params["threshold"] = st.sidebar.slider("Modified Z-score threshold", 1.5, 5.0, 3.5, 0.1)
     elif method == "Grubbs' test":
         params["alpha"] = st.sidebar.slider("Significance level (alpha)", 0.01, 0.10, 0.05, 0.01)
-        params["iterative"] = st.sidebar.checkbox("Remove outliers iteratively (test again after each removal)", value=True)
+        params["iterative"] = st.sidebar.checkbox("Remove outliers iteratively", value=True)
 
     result = run_outlier_detection(df, group_cols, conc_col, method, params)
     n_outliers = int(result["Is_Outlier"].sum())
@@ -279,7 +344,8 @@ with tab_outlier:
     fig = go.Figure()
     normal = result[~result["Is_Outlier"]]
     outliers = result[result["Is_Outlier"]]
-    color_map = {g: c for g, c in zip(all_groups, ["steelblue", "seagreen", "darkorange", "purple", "teal", "brown"])}
+    palette = ["steelblue", "seagreen", "darkorange", "purple", "teal", "brown"]
+    color_map = {g: palette[i % len(palette)] for i, g in enumerate(all_groups)}
 
     for g in all_groups:
         sub_n = normal[normal[group_col] == g]
@@ -346,15 +412,21 @@ with tab_ttest:
         st.warning("Select at least 2 groups to run a comparison.")
         st.stop()
 
-    subset = df[df[group_col].isin(selected_groups)]
-    available_subjects = sorted(subset[subj_col].unique().tolist())
+    tc_subset = df[df[group_col].isin(selected_groups)]
+    pk_all = st.session_state.pk_data.copy()
+    pk_subset_groups = pk_all[pk_all[group_col].isin(selected_groups)] if group_col in pk_all.columns else pk_all.iloc[0:0]
+
+    available_subjects = sorted(set(tc_subset[subj_col].unique().tolist()) | set(
+        pk_subset_groups[subj_col].unique().tolist() if subj_col in pk_subset_groups.columns else []
+    ))
 
     st.markdown("**Step 2 — include/exclude specific subjects**")
     excluded_subjects = st.multiselect(
         "Subjects to EXCLUDE from this analysis (e.g. subjects you've flagged as outliers above)",
         available_subjects, default=[],
     )
-    subset = subset[~subset[subj_col].isin(excluded_subjects)]
+    tc_subset = tc_subset[~tc_subset[subj_col].isin(excluded_subjects)]
+    pk_subset = pk_subset_groups[~pk_subset_groups[subj_col].isin(excluded_subjects)] if not pk_subset_groups.empty else pk_subset_groups
 
     equal_var = st.checkbox(
         "Assume equal variances (standard t-test)", value=False,
@@ -369,7 +441,7 @@ with tab_ttest:
 
     comparison_type = st.radio(
         "What do you want to compare?",
-        ["Time-concentration data (per time point)", "PK parameters (Cmax, Tmax, AUClast)"],
+        ["Time-concentration data (per time point)", "PK parameters (from the PK Parameter sheet)"],
     )
 
     if comparison_type.startswith("Time-concentration"):
@@ -377,9 +449,9 @@ with tab_ttest:
         for g1, g2 in pairs:
             st.markdown(f"**{g1} vs {g2}**")
             rows = []
-            for t in sorted(subset[time_col].unique()):
-                a = subset[(subset[group_col] == g1) & (subset[time_col] == t)][conc_col]
-                b = subset[(subset[group_col] == g2) & (subset[time_col] == t)][conc_col]
+            for t in sorted(tc_subset[time_col].unique()):
+                a = tc_subset[(tc_subset[group_col] == g1) & (tc_subset[time_col] == t)][conc_col]
+                b = tc_subset[(tc_subset[group_col] == g2) & (tc_subset[time_col] == t)][conc_col]
                 res = two_sample_ttest(a, b, equal_var=equal_var)
                 rows.append({"Time": t, **res})
             res_df = pd.DataFrame(rows)
@@ -388,26 +460,24 @@ with tab_ttest:
                          use_container_width=True)
 
     else:
-        st.markdown("### PK parameters derived from time-concentration data")
-        st.caption("Cmax = max observed concentration; Tmax = time of Cmax; AUClast = linear trapezoidal AUC up to the last time point, computed per subject.")
-        pk_df = compute_pk_params(subset, group_col, subj_col, time_col, conc_col)
-        st.dataframe(pk_df, use_container_width=True)
+        if pk_subset.empty:
+            st.warning("No matching rows found in the PK Parameter sheet for the selected groups/subjects. "
+                       "Fill in the PK Parameter sheet above (Step 1) first.")
+        else:
+            param_cols = [c for c in pk_subset.columns if c not in (group_col, subj_col)]
+            chosen_params = st.multiselect("Parameters to test", param_cols, default=param_cols)
+            st.dataframe(pk_subset, use_container_width=True)
 
-        st.markdown("### Results: t-test on PK parameters")
-        for g1, g2 in pairs:
-            st.markdown(f"**{g1} vs {g2}**")
-            rows = []
-            for param in ["Cmax", "Tmax", "AUClast"]:
-                a = pk_df[pk_df[group_col] == g1][param]
-                b = pk_df[pk_df[group_col] == g2][param]
-                res = two_sample_ttest(a, b, equal_var=equal_var)
-                rows.append({"Parameter": param, **res})
-            res_df = pd.DataFrame(rows)
-            res_df["significant"] = res_df["significant"].map({True: "Yes (p<0.05)", False: "No", None: "n<2, skipped"})
-            st.dataframe(res_df.style.format({"mean1": "{:.3g}", "mean2": "{:.3g}", "t_stat": "{:.3g}", "p_value": "{:.4f}"}),
-                         use_container_width=True)
-
-        csv_buffer2 = io.StringIO()
-        pk_df.to_csv(csv_buffer2, index=False)
-        st.download_button("Download derived PK parameters as CSV", data=csv_buffer2.getvalue(),
-                            file_name="pk_parameters.csv", mime="text/csv", key="download_pk")
+            st.markdown("### Results: t-test on PK parameters")
+            for g1, g2 in pairs:
+                st.markdown(f"**{g1} vs {g2}**")
+                rows = []
+                for param in chosen_params:
+                    a = pd.to_numeric(pk_subset[pk_subset[group_col] == g1][param], errors="coerce")
+                    b = pd.to_numeric(pk_subset[pk_subset[group_col] == g2][param], errors="coerce")
+                    res = two_sample_ttest(a, b, equal_var=equal_var)
+                    rows.append({"Parameter": param, **res})
+                res_df = pd.DataFrame(rows)
+                res_df["significant"] = res_df["significant"].map({True: "Yes (p<0.05)", False: "No", None: "n<2, skipped"})
+                st.dataframe(res_df.style.format({"mean1": "{:.3g}", "mean2": "{:.3g}", "t_stat": "{:.3g}", "p_value": "{:.4f}"}),
+                             use_container_width=True)
