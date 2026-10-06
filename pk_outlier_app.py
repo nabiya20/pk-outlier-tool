@@ -25,9 +25,12 @@ import json
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.offline import get_plotlyjs
 from scipy import stats
 import streamlit as st
 import streamlit.components.v1 as components
+from plot_helpers import (PLOT_WIDTH, PLOT_HEIGHT, FONT_FAMILIES, GROUP_COLORS,
+                          style_figure, profile_ranges, distribution_figure)
 
 st.set_page_config(page_title="PK Outlier & Comparison Tool", layout="wide")
 
@@ -56,19 +59,16 @@ h3 { color:#2C6E91; font-size:1.05rem; margin-top:14px; }
 </style>
 """, unsafe_allow_html=True)
 
-# Colors reserved: PALETTE for groups in the Outlier Detection view (muted,
-# navy/teal/gray family — kept subdued on purpose so flagged points stand
-# out), FLAG_COLOR exclusively for flagged/significant markers.
-PALETTE = ["#1B4965", "#2C6E91", "#5FA8D3", "#7D8597", "#3C6E71", "#849324", "#8D5B4C", "#5C5C8A"]
+# Red is reserved for flags/significance; group colors are shared by all plots.
 FLAG_COLOR = "#C1121F"
 FLAG_TINT = "#FBEAEA"
 
 # PROFILE_PALETTE: default colors for the PK Profile Plot tab. These need to
 # be clearly distinguishable from each other at a glance (e.g. Reference vs.
-# Test groups), so this uses a high-contrast, colorblind-safe (Okabe-Ito
-# based) sequence rather than the muted PALETTE above. Still fully
+# Test groups), so this uses a brighter, distinct sequence. Still fully
 # user-adjustable per group via the color pickers.
-PROFILE_PALETTE = ["#1A1A1A", "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#8D5B4C"]
+PROFILE_PALETTE = GROUP_COLORS
+PALETTE = GROUP_COLORS
 
 TC_COLUMNS = ["Group", "Subject", "Time", "Concentration"]
 PK_DEFAULT_COLUMNS = ["Group", "Subject", "Cmax", "AUC", "AUC_partial"]
@@ -318,15 +318,74 @@ def handle_upload(uploader_key, session_key, pending_key, columns_hint):
 # STAGE 1: Data
 # ========================================================================
 
+def render_copyable_plot(fig, height):
+    """Renders with the installed Plotly JavaScript bundle and an added
+    'Copy image to clipboard' button, so the plot can be pasted into slides
+    or reports without a separate download step. Falls back gracefully if
+    the browser doesn't support the Clipboard image API."""
+    fig_json = fig.to_json().replace("<", "\\u003c")
+    plotly_js = get_plotlyjs()
+    html = f"""
+    <div style="max-width:{PLOT_WIDTH}px;width:100%;" id="plotdiv_{id(fig)}"></div>
+    <div style="margin-top:6px;">
+      <button id="copybtn_{id(fig)}" style="padding:6px 14px;background:#1B4965;color:#fff;
+        border:none;border-radius:4px;cursor:pointer;font-family:Arial,sans-serif;font-size:13px;">
+        Copy image to clipboard
+      </button>
+      <span id="copystatus_{id(fig)}" style="margin-left:10px;font-family:Arial,sans-serif;
+        font-size:13px;color:#5A6B7B;"></span>
+    </div>
+    <script>{plotly_js}</script>
+    <script>
+    (function() {{
+        var figData = {fig_json};
+        var gd = document.getElementById('plotdiv_{id(fig)}');
+        var ready = Plotly.newPlot(gd, figData.data, figData.layout, {{displayModeBar: true, responsive: true, toImageButtonOptions: {{format: 'png', width: figData.layout.width, height: figData.layout.height, scale: 2}}}});
+        document.getElementById('copybtn_{id(fig)}').addEventListener('click', function() {{
+            var statusEl = document.getElementById('copystatus_{id(fig)}');
+            ready.then(function() {{ return Plotly.toImage(gd, {{format: 'png', width: figData.layout.width, height: figData.layout.height, scale: 2}}); }})
+                .then(function(url) {{
+                    return fetch(url).then(function(res) {{ return res.blob(); }});
+                }})
+                .then(function(blob) {{
+                    if (navigator.clipboard && window.ClipboardItem) {{
+                        navigator.clipboard.write([new ClipboardItem({{'image/png': blob}})]).then(function() {{
+                            statusEl.innerText = 'Copied!';
+                            setTimeout(function() {{ statusEl.innerText = ''; }}, 2000);
+                        }}).catch(function() {{
+                            statusEl.innerText = 'Copy not supported in this browser — use the camera icon above to download instead.';
+                        }});
+                    }} else {{
+                        statusEl.innerText = 'Copy not supported in this browser — use the camera icon above to download instead.';
+                    }}
+                }}).catch(function() {{
+                    statusEl.innerText = "Could not copy image — use the camera icon to download a PNG.";
+                }});
+        }});
+    }})();
+    </script>
+    """
+    if hasattr(st, "iframe"):
+        st.iframe(html, height=height + 70)
+    else:
+        components.html(html, height=height + 70, scrolling=False)
+
+
 st.header("Data")
 entry_tab_tc, entry_tab_pk = st.tabs(["Time–Concentration Data", "PK Parameter Data"])
 
 with entry_tab_tc:
+    u1, u2 = st.columns(2)
+    with u1:
+        time_unit = st.text_input("Time unit", value="hours", key="tc_time_unit").strip() or "hours"
+    with u2:
+        conc_unit = st.text_input("Concentration unit", value="ng/mL", key="tc_conc_unit").strip() or "ng/mL"
+    st.caption("Units label your existing values; editing a unit does not convert the data.")
     handle_upload("up_tc", "tc_data", "pending_upload_tc", TC_COLUMNS)
 
     with st.expander("Need help? Data format & instructions", expanded=False):
         st.markdown("Required columns: **Group**, **Subject**, **Time**, **Concentration**. Example:")
-        st.dataframe(example_tc_snippet(), use_container_width=True, hide_index=True)
+        st.dataframe(example_tc_snippet(), width="stretch", hide_index=True)
         st.markdown(
             "- Click the top-left cell of the editable grid below and paste (Ctrl+V / Cmd+V) a block copied from Excel.\n"
             "- Add or remove rows directly in the grid (use the `+`/row menu).\n"
@@ -343,19 +402,20 @@ with entry_tab_tc:
         n_groups_tc = st.session_state.tc_data[group_col].nunique() if group_col in st.session_state.tc_data.columns else 0
         n_subj_tc = st.session_state.tc_data[subj_col].nunique() if subj_col in st.session_state.tc_data.columns else 0
         st.caption(f"{n_tc} row(s) · {n_groups_tc} group(s) · {n_subj_tc} subject(s) — preview below, expand 'Edit data' to see or change all rows.")
-        st.dataframe(st.session_state.tc_data.head(5), use_container_width=True, hide_index=True, height=200)
+        st.dataframe(st.session_state.tc_data.head(5), width="stretch", hide_index=True, height=200,
+                     column_config={"Time": f"Time ({time_unit})", "Concentration": f"Concentration ({conc_unit})"})
 
     with st.expander(f"Edit data ({n_tc} rows)", expanded=(n_tc == 0)):
         st.session_state.tc_data = st.data_editor(
             st.session_state.tc_data,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             key="tc_editor",
             column_config={
                 "Group": st.column_config.TextColumn(required=True),
                 "Subject": st.column_config.TextColumn(required=True),
-                "Time": st.column_config.NumberColumn(required=True),
-                "Concentration": st.column_config.NumberColumn(required=True),
+                "Time": st.column_config.NumberColumn(label=f"Time ({time_unit})", required=True),
+                "Concentration": st.column_config.NumberColumn(label=f"Concentration ({conc_unit})", required=True),
             },
         )
         cc1, _ = st.columns([1, 5])
@@ -374,6 +434,17 @@ with entry_tab_tc:
                 st.rerun()
 
 with entry_tab_pk:
+    with st.expander("Parameter units", expanded=False):
+        st.caption("Set a label for each parameter. Values are not converted. Use matching units when comparing groups.")
+        pk_units = {}
+        for column in st.session_state.pk_data.columns:
+            if column in ("Group", "Subject"):
+                continue
+            normalized = column.lower()
+            default_unit = (f"{time_unit}·{conc_unit}" if normalized.startswith("auc") else
+                            time_unit if normalized in ("tmax", "t_half", "t1/2") else
+                            conc_unit if normalized.startswith("cmax") else "")
+            pk_units[column] = st.text_input(f"{column} unit", value=default_unit, key=f"pk_unit_{column}").strip()
     handle_upload("up_pk", "pk_data", "pending_upload_pk", PK_DEFAULT_COLUMNS)
 
     with st.expander("Need help? Data format & instructions", expanded=False):
@@ -391,7 +462,8 @@ with entry_tab_pk:
     else:
         n_groups_pk = st.session_state.pk_data[group_col].nunique() if group_col in st.session_state.pk_data.columns else 0
         st.caption(f"{n_pk} row(s) · {n_groups_pk} group(s) — preview below, expand 'Edit data' to see or change all rows.")
-        st.dataframe(st.session_state.pk_data.head(5), use_container_width=True, hide_index=True, height=200)
+        st.dataframe(st.session_state.pk_data.head(5), width="stretch", hide_index=True, height=200,
+                     column_config={c: f"{c} ({u})" for c, u in pk_units.items() if u})
 
     with st.expander(f"Edit data ({n_pk} rows)", expanded=(n_pk == 0)):
         col_a, col_b = st.columns([3, 1])
@@ -417,12 +489,12 @@ with entry_tab_pk:
         }
         for c in st.session_state.pk_data.columns:
             if c not in ("Group", "Subject"):
-                column_config_pk[c] = st.column_config.NumberColumn()
+                column_config_pk[c] = st.column_config.NumberColumn(label=f"{c} ({pk_units[c]})" if pk_units.get(c) else c)
 
         st.session_state.pk_data = st.data_editor(
             st.session_state.pk_data,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             key="pk_editor",
             column_config=column_config_pk,
         )
@@ -444,6 +516,11 @@ with entry_tab_pk:
 # ========================================================================
 # Clean time-concentration data for analysis
 # ========================================================================
+
+with st.expander("Plot appearance", expanded=False):
+    font_choice = st.selectbox("Plot font", list(FONT_FAMILIES), key="plot_font")
+    st.caption("The selected font is used in all plots and exported images. If unavailable on your computer, the browser uses a fallback.")
+plot_font = FONT_FAMILIES[font_choice]
 
 df_raw = st.session_state.tc_data.copy()
 required_tc_cols = {group_col, subj_col, time_col, conc_col}
@@ -505,6 +582,20 @@ else:
                     params["alpha"] = st.slider("Significance level (alpha)", 0.01, 0.10, 0.05, 0.01, key="alpha_outlier")
                     params["iterative"] = st.checkbox("Remove outliers iteratively", value=True, key="iter_outlier")
 
+        with st.expander("How do the outlier methods differ?", expanded=False):
+            st.markdown("""
+| Method | Simple explanation | What to keep in mind |
+| --- | --- | --- |
+| **IQR** | Flags values outside fences around the middle 50% of values: Q1 − k×IQR to Q3 + k×IQR. | Uses quartiles rather than the mean; this app requires at least 4 values per comparison subset. |
+| **Z-score** | Measures how many standard deviations a value is from the mean. | Extreme values can shift the mean and SD, making other outliers harder to detect. Most meaningful for roughly normal data; at least 3 values here. |
+| **Modified Z-score** | Measures distance from the median using the median absolute deviation (MAD). | Less affected by extremes. This implementation gives zero scores if MAD is zero; at least 3 values here. |
+| **Grubbs' test** | Tests whether the most extreme value is unusually far from the mean at the selected significance level. | Assumes approximately normal data; at least 3 values. Iterative mode repeats after temporarily removing a flagged value from the test subset. |
+
+A higher IQR/Z-score threshold flags fewer values; a lower Grubbs alpha is more stringent. Iterative Grubbs testing does not guarantee an overall false-positive rate equal to alpha. Small subsets limit detection. Flags identify unusual observations; they do not automatically delete your data.
+
+For PK profiles, **Group + Time point** compares subjects at the same time within the same group. Pooling different times or treatment groups can flag expected PK differences.
+""")
+
         if grouping_choice.startswith("Group + Time"):
             group_cols = [group_col, time_col]
             scope_label = "Group + Time point"
@@ -525,7 +616,7 @@ else:
             param_label = f"alpha={params['alpha']}"
         else:
             param_label = f"threshold={params['threshold']}"
-        st.caption(f"Showing results for **{method}** ({param_label}) · Comparison scope: **{scope_label}**")
+        st.caption(f"Showing results for **{method}** ({param_label}) · Comparison scope: **{scope_label}** · Time: {time_unit} · Concentration: {conc_unit}")
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Data points analyzed", n_total)
@@ -534,9 +625,9 @@ else:
 
         def comparison_group_label(row):
             if group_cols == [group_col, time_col]:
-                return f"{row[group_col]} @ t={row[time_col]}"
+                return f"{row[group_col]} @ t={row[time_col]} {time_unit}"
             elif group_cols == [time_col]:
-                return f"All groups @ t={row[time_col]}"
+                return f"All groups @ t={row[time_col]} {time_unit}"
             return "All data"
 
         st.subheader("Flagged observations")
@@ -563,7 +654,7 @@ else:
             show_cols = [group_col, subj_col, time_col, conc_col, "Comparison group", "Score", "Detail", "N_in_subset"]
             st.dataframe(
                 flagged_view[show_cols].sort_values(by=[group_col, time_col]).rename(columns={"N_in_subset": "n in comparison group"}),
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
             dl1, _ = st.columns([1, 4])
             with dl1:
@@ -576,7 +667,7 @@ else:
         with st.expander("Full results & statistical details (all data points)"):
             result_display = result.copy()
             result_display["Flagged as outlier"] = result_display.pop("Is_Outlier").map({True: "Yes", False: "No"})
-            st.dataframe(result_display, use_container_width=True, hide_index=True)
+            st.dataframe(result_display, width="stretch", hide_index=True)
             st.download_button(
                 "Download full results (CSV)",
                 data=result_display.to_csv(index=False),
@@ -611,27 +702,25 @@ else:
                       for g, s, t, c in zip(flagged_pts[group_col], flagged_pts[subj_col], flagged_pts[time_col], flagged_pts[conc_col])],
                 hoverinfo="text",
             ))
-            fig.update_layout(xaxis_title="Time", yaxis_title="Concentration", height=500,
-                               template="simple_white",
-                               legend=dict(orientation="h", yanchor="bottom", y=1.02))
-            st.plotly_chart(fig, use_container_width=True)
+            style_figure(fig, plot_font, f"Time ({time_unit})", f"Concentration ({conc_unit})")
+            fig.update_xaxes(rangemode="tozero")
+            fig.update_yaxes(rangemode="tozero")
+            render_copyable_plot(fig, PLOT_HEIGHT)
 
         with viz_tab2:
             box_group_by = st.radio("Group by", ["Time only", "Group + Time"], horizontal=True, key="box_group_by")
-            fig_box = go.Figure()
-            if box_group_by == "Time only":
-                for t, g in df.groupby(time_col):
-                    fig_box.add_trace(go.Box(y=g[conc_col], name=str(t), boxpoints="all", jitter=0.4,
-                                              marker_color=PALETTE[0]))
-                fig_box.update_layout(xaxis_title="Time", yaxis_title="Concentration", height=450, template="simple_white")
+            available_times = sorted(df[time_col].unique().tolist())
+            box_times = st.multiselect("Time points to display", available_times, default=available_times,
+                                      key="box_times", help="Select fewer time points if the plot is crowded; analytical results are unchanged.")
+            if box_times:
+                fig_box = distribution_figure(df, all_groups, sorted(box_times), box_group_by == "Group + Time",
+                                              PALETTE, plot_font, f"Time ({time_unit})", f"Concentration ({conc_unit})")
+                render_copyable_plot(fig_box, PLOT_HEIGHT)
+                st.caption("Each box shows Q1, median and Q3. Whiskers extend to the most extreme values within 1.5×IQR; all observations are overlaid. Time categories are evenly spaced, not a continuous time axis. Box whiskers are independent of the selected outlier method.")
+                if len(box_times) * (len(all_groups) if box_group_by == "Group + Time" else 1) > 30:
+                    st.info("Many boxes are displayed. Select fewer time points above to inspect the distributions more clearly.")
             else:
-                for i, grp in enumerate(all_groups):
-                    g = df[df[group_col] == grp]
-                    fig_box.add_trace(go.Box(x=g[time_col], y=g[conc_col], name=grp, boxpoints="all", jitter=0.4,
-                                              marker_color=PALETTE[i % len(PALETTE)]))
-                fig_box.update_layout(xaxis_title="Time", yaxis_title="Concentration", height=450,
-                                       boxmode="group", template="simple_white")
-            st.plotly_chart(fig_box, use_container_width=True)
+                st.info("Select at least one time point to display distributions.")
 
     # --------------------------------------------------------------
     # TAB 2: Group Comparison (t-test)
@@ -696,7 +785,7 @@ else:
                     styled = res_df.style.format(
                         {"mean1": "{:.3g}", "mean2": "{:.3g}", "t_stat": "{:.3g}", "p_value": "{:.4f}"}
                     ).apply(style_significant, axis=1)
-                    st.dataframe(styled, use_container_width=True, hide_index=True)
+                    st.dataframe(styled, width="stretch", hide_index=True)
             else:
                 if pk_subset.empty:
                     st.warning("No matching rows found in the PK Parameter sheet for the selected groups/subjects. "
@@ -706,7 +795,7 @@ else:
                     param_cols = [c for c in pk_subset.columns if c not in (group_col, subj_col)]
                     chosen_params = st.multiselect("Parameters to test", param_cols, default=param_cols, key="ttest_params")
                     with st.expander(f"PK parameter data used ({len(pk_subset)} rows)"):
-                        st.dataframe(pk_subset, use_container_width=True, hide_index=True)
+                        st.dataframe(pk_subset, width="stretch", hide_index=True)
 
                     st.subheader("Results: t-test on PK parameters")
                     for ga, gb in pairs:
@@ -716,13 +805,13 @@ else:
                             a = pd.to_numeric(pk_subset[pk_subset[group_col] == ga][param], errors="coerce")
                             b = pd.to_numeric(pk_subset[pk_subset[group_col] == gb][param], errors="coerce")
                             res = two_sample_ttest(a, b, equal_var=equal_var)
-                            rows.append({"Parameter": param, **res})
+                            rows.append({"Parameter": param, "Unit": pk_units.get(param, ""), **res})
                         res_df = pd.DataFrame(rows)
                         res_df["significant"] = res_df["significant"].map({True: "Yes (p<0.05)", False: "No", None: "n<2, skipped"})
                         styled = res_df.style.format(
                             {"mean1": "{:.3g}", "mean2": "{:.3g}", "t_stat": "{:.3g}", "p_value": "{:.4f}"}
                         ).apply(style_significant, axis=1)
-                        st.dataframe(styled, use_container_width=True, hide_index=True)
+                        st.dataframe(styled, width="stretch", hide_index=True)
 
     # --------------------------------------------------------------
     # TAB 3: PK Profile Plot
@@ -764,14 +853,20 @@ else:
 
                 with st.container(border=True):
                     st.markdown("**Titles & axes**")
+                    for title_key, default_title in (("profile_xtitle", f"Time ({time_unit})"),
+                                                     ("profile_ytitle", f"{conc_col} ({conc_unit})")):
+                        previous = st.session_state.get(title_key + "_unit_default")
+                        if title_key not in st.session_state or st.session_state[title_key] == previous:
+                            st.session_state[title_key] = default_title
+                        st.session_state[title_key + "_unit_default"] = default_title
                     tc1, tc2, tc3 = st.columns(3)
                     with tc1:
                         plot_title = st.text_input("Plot title (shown on the plot)", value="PK Profile", key="profile_title")
                     with tc2:
-                        x_axis_title = st.text_input("X-axis title", value="Time (h)", key="profile_xtitle",
+                        x_axis_title = st.text_input("X-axis title", key="profile_xtitle",
                                                       help="Edit the unit to match your data, e.g. 'Time (day)'.")
                     with tc3:
-                        y_axis_title = st.text_input("Y-axis title", value=f"{conc_col} (ng/mL)", key="profile_ytitle")
+                        y_axis_title = st.text_input("Y-axis title", key="profile_ytitle")
 
                     ac1, ac2, ac3 = st.columns(3)
                     with ac1:
@@ -790,7 +885,7 @@ else:
                         st.caption("Enter your own MEC value below — it is not calculated from the data.")
                         mv1, mv2 = st.columns(2)
                         with mv1:
-                            mec_value = st.number_input("MEC value (ng/mL)", min_value=0.0, value=0.0, step=1.0, key="profile_mec_value")
+                            mec_value = st.number_input(f"MEC value ({conc_unit})", min_value=0.0, value=0.0, step=1.0, key="profile_mec_value")
                         with mv2:
                             mec_label = st.text_input("MEC line label", value="MEC", key="profile_mec_label")
                         if mec_value == 0.0:
@@ -810,20 +905,31 @@ else:
                         st.warning("Couldn't parse X-axis tick values — using automatic ticks instead.")
                         x_ticks = None
 
-                PLOT_WIDTH, PLOT_HEIGHT = 640, 460
-
                 def build_profile_figure(log_y: bool):
+                    xrange, yrange = profile_ranges(summary, error_metric == "SD", log_y,
+                                                    mec_value if include_mec else None)
                     fig = go.Figure()
                     for g in profile_groups:
                         g_data = summary[summary[group_col] == g].sort_values(time_col)
+                        if log_y:
+                            g_data = g_data.copy()
+                            g_data.loc[g_data["mean"] <= 0, "mean"] = np.nan
                         err = g_data["sd"].fillna(0) if error_metric == "SD" else None
+                        error_config = None
+                        if err is not None:
+                            error_config = dict(type="data", array=err, visible=True, thickness=1, width=3)
+                            if log_y and yrange is not None:
+                                error_config.update(symmetric=False,
+                                    arrayminus=np.minimum(err, np.maximum(g_data["mean"] - 10 ** yrange[0], 0)))
                         fig.add_trace(go.Scatter(
                             x=g_data[time_col], y=g_data["mean"],
                             mode="lines+markers",
                             name=rename_map.get(g, g),
                             line=dict(color=color_map_profile.get(g), width=2.5),
                             marker=dict(size=7, color=color_map_profile.get(g)),
-                            error_y=dict(type="data", array=err, visible=True) if err is not None else None,
+                            error_y=error_config,
+                            customdata=g_data[["sd", "n"]].to_numpy(),
+                            hovertemplate=f"Time ({time_unit}): %{{x}}<br>Mean ({conc_unit}): %{{y:.4g}}<br>SD: %{{customdata[0]:.4g}}<br>n: %{{customdata[1]}}<extra>%{{fullData.name}}</extra>",
                         ))
 
                     if include_mec and mec_value:
@@ -831,9 +937,9 @@ else:
                                       annotation_text=mec_label, annotation_position="top left")
 
                     fig.update_layout(
-                        title=dict(text=f"<b>{plot_title}</b>", x=0.5, xanchor="center", font=dict(size=18, family="Arial", color="#1B4965")),
+                        title=dict(text=f"<b>{plot_title}</b>", x=0.5, xanchor="center", font=dict(size=18, family=plot_font, color="#1B4965")),
                         template="simple_white",
-                        font=dict(family="Arial", size=13, color="#1F2937"),
+                        font=dict(family=plot_font, size=13, color="#1F2937"),
                         legend=dict(
                             bordercolor="lightgray", borderwidth=1, bgcolor="rgba(255,255,255,0.75)",
                             x=0.99, y=0.99, xanchor="right", yanchor="top",
@@ -842,84 +948,44 @@ else:
                         margin=dict(t=60, r=25, l=65, b=55),
                         plot_bgcolor="white", paper_bgcolor="white",
                     )
-                    axis_title_font = dict(size=14, color="#000000", family="Arial Black, Arial, sans-serif")
+                    axis_title_font = dict(size=14, color="#000000", family=plot_font)
                     fig.update_xaxes(
                         title=dict(text=f"<b>{x_axis_title}</b>", font=axis_title_font),
                         showline=True, linewidth=1.2, linecolor="black", mirror=False,
-                        showgrid=True, gridcolor="#E3E8EC", zeroline=False,
+                        showgrid=False, zeroline=False,
                     )
+                    fig.update_xaxes(range=xrange, autorange=False)
                     if x_ticks:
                         fig.update_xaxes(tickmode="array", tickvals=x_ticks)
                     if log_y:
                         fig.update_yaxes(
                             title=dict(text=f"<b>{y_axis_title}</b>", font=axis_title_font),
-                            type="log", dtick=1, exponentformat="none",
+                            type="log", range=yrange, autorange=False, dtick=1, exponentformat="none",
                             showline=True, linewidth=1.2, linecolor="black", mirror=False,
-                            showgrid=True, gridcolor="#E3E8EC", zeroline=False,
+                            showgrid=False, zeroline=False,
                             minor=dict(showgrid=False, ticks=""),
                         )
                     else:
                         fig.update_yaxes(
+                            range=yrange, autorange=False,
                             title=dict(text=f"<b>{y_axis_title}</b>", font=axis_title_font),
                             showline=True, linewidth=1.2, linecolor="black", mirror=False,
-                            showgrid=True, gridcolor="#E3E8EC", zeroline=False,
+                            showgrid=False, zeroline=False,
                         )
                         if y_interval_linear > 0:
                             fig.update_yaxes(dtick=y_interval_linear)
                     return fig
-
-                def render_copyable_plot(fig, height):
-                    """Renders a Plotly figure via plotly.js directly (CDN) with an added
-                    'Copy image to clipboard' button, so the plot can be pasted into slides
-                    or reports without a separate download step. Falls back gracefully if
-                    the browser doesn't support the Clipboard image API."""
-                    fig_json = fig.to_json()
-                    html = f"""
-                    <div id="plotdiv_{id(fig)}"></div>
-                    <div style="margin-top:6px;">
-                      <button id="copybtn_{id(fig)}" style="padding:6px 14px;background:#1B4965;color:#fff;
-                        border:none;border-radius:4px;cursor:pointer;font-family:Arial,sans-serif;font-size:13px;">
-                        Copy image to clipboard
-                      </button>
-                      <span id="copystatus_{id(fig)}" style="margin-left:10px;font-family:Arial,sans-serif;
-                        font-size:13px;color:#5A6B7B;"></span>
-                    </div>
-                    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-                    <script>
-                    (function() {{
-                        var figData = {fig_json};
-                        var gd = document.getElementById('plotdiv_{id(fig)}');
-                        Plotly.newPlot(gd, figData.data, figData.layout, {{displayModeBar: true, responsive: false}});
-                        document.getElementById('copybtn_{id(fig)}').addEventListener('click', function() {{
-                            var statusEl = document.getElementById('copystatus_{id(fig)}');
-                            Plotly.toImage(gd, {{format: 'png', width: figData.layout.width, height: figData.layout.height, scale: 2}})
-                                .then(function(url) {{
-                                    return fetch(url).then(function(res) {{ return res.blob(); }});
-                                }})
-                                .then(function(blob) {{
-                                    if (navigator.clipboard && window.ClipboardItem) {{
-                                        navigator.clipboard.write([new ClipboardItem({{'image/png': blob}})]).then(function() {{
-                                            statusEl.innerText = 'Copied!';
-                                            setTimeout(function() {{ statusEl.innerText = ''; }}, 2000);
-                                        }}).catch(function() {{
-                                            statusEl.innerText = 'Copy not supported in this browser — use the camera icon above to download instead.';
-                                        }});
-                                    }} else {{
-                                        statusEl.innerText = 'Copy not supported in this browser — use the camera icon above to download instead.';
-                                    }}
-                                }});
-                        }});
-                    }})();
-                    </script>
-                    """
-                    components.html(html, height=height + 70, scrolling=False)
 
                 st.subheader("Plot")
                 plot_tab_linear, plot_tab_log = st.tabs(["Linear scale", "Semi-log scale"])
                 with plot_tab_linear:
                     render_copyable_plot(build_profile_figure(log_y=False), PLOT_HEIGHT)
                 with plot_tab_log:
-                    render_copyable_plot(build_profile_figure(log_y=True), PLOT_HEIGHT)
+                    if (summary["mean"] > 0).any():
+                        render_copyable_plot(build_profile_figure(log_y=True), PLOT_HEIGHT)
+                        st.caption("Semi-log: X starts at zero. The Y-axis starts at a positive power of ten because log(0) is undefined. Nonpositive means and SD portions below the displayed minimum are not shown; data and statistics remain unchanged.")
+                    else:
+                        st.info("The semi-log plot needs at least one positive mean concentration.")
 
                 st.caption(
                     "Click \"Copy image to clipboard\" to paste the plot directly into slides or documents, "
