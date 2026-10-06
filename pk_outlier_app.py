@@ -20,12 +20,14 @@ Run with:
 
 import io
 import itertools
+import json
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from scipy import stats
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="PK Outlier & Comparison Tool", layout="wide")
 
@@ -54,11 +56,19 @@ h3 { color:#2C6E91; font-size:1.05rem; margin-top:14px; }
 </style>
 """, unsafe_allow_html=True)
 
-# Colors reserved: PALETTE for groups (navy/teal/gray family), FLAG_COLOR
-# exclusively for flagged/significant markers so it always stands out.
+# Colors reserved: PALETTE for groups in the Outlier Detection view (muted,
+# navy/teal/gray family — kept subdued on purpose so flagged points stand
+# out), FLAG_COLOR exclusively for flagged/significant markers.
 PALETTE = ["#1B4965", "#2C6E91", "#5FA8D3", "#7D8597", "#3C6E71", "#849324", "#8D5B4C", "#5C5C8A"]
 FLAG_COLOR = "#C1121F"
 FLAG_TINT = "#FBEAEA"
+
+# PROFILE_PALETTE: default colors for the PK Profile Plot tab. These need to
+# be clearly distinguishable from each other at a glance (e.g. Reference vs.
+# Test groups), so this uses a high-contrast, colorblind-safe (Okabe-Ito
+# based) sequence rather than the muted PALETTE above. Still fully
+# user-adjustable per group via the color pickers.
+PROFILE_PALETTE = ["#1A1A1A", "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#8D5B4C"]
 
 TC_COLUMNS = ["Group", "Subject", "Time", "Concentration"]
 PK_DEFAULT_COLUMNS = ["Group", "Subject", "Cmax", "AUC", "AUC_partial"]
@@ -207,10 +217,19 @@ def demo_tc_df():
             subj = f"{grp}_S{i:02d}"
             base = rng.uniform(0.85, 1.15) * base_dose
             for t in timepoints:
-                conc = base * np.exp(-0.15 * t) + rng.normal(0, 2)
-                rows.append({"Group": grp, "Subject": subj, "Time": t, "Concentration": round(max(conc, 0), 2)})
-    rows.append({"Group": "Test1", "Subject": "Test1_S99_outlier", "Time": 4, "Concentration": 300})
-    return pd.DataFrame(rows)
+                if t == 0:
+                    conc = 0.0  # pre-dose baseline sample
+                else:
+                    conc = max(base * np.exp(-0.15 * t) + rng.normal(0, 2), 0)
+                rows.append({"Group": grp, "Subject": subj, "Time": t, "Concentration": round(conc, 2)})
+
+    # Inject one realistic outlier: pick a random existing (non-zero) sample
+    # and replace its value, rather than adding a fabricated extra subject.
+    demo_df = pd.DataFrame(rows)
+    non_baseline_idx = demo_df.index[demo_df["Time"] != 0]
+    outlier_idx = rng.choice(non_baseline_idx)
+    demo_df.loc[outlier_idx, "Concentration"] = round(demo_df.loc[outlier_idx, "Concentration"] * 6 + 50, 2)
+    return demo_df
 
 
 def demo_pk_df():
@@ -731,7 +750,8 @@ else:
             else:
                 with st.container(border=True):
                     st.markdown("**Labels & colors**")
-                    default_palette = PALETTE
+                    st.caption("Default colors are chosen to be clearly distinguishable between groups. Adjust any of them below if needed.")
+                    default_palette = PROFILE_PALETTE
                     rename_map, color_map_profile = {}, {}
                     label_cols = st.columns(min(len(profile_groups), 4)) if profile_groups else []
                     for i, g in enumerate(profile_groups):
@@ -743,12 +763,13 @@ else:
                         color_map_profile.setdefault(g, default_palette[i % len(default_palette)])
 
                 with st.container(border=True):
-                    st.markdown("**Titles, axes & error bars**")
+                    st.markdown("**Titles & axes**")
                     tc1, tc2, tc3 = st.columns(3)
                     with tc1:
-                        plot_title = st.text_input("Plot title", value="PK Profile", key="profile_title")
+                        plot_title = st.text_input("Plot title (shown on the plot)", value="PK Profile", key="profile_title")
                     with tc2:
-                        x_axis_title = st.text_input("X-axis title", value=str(time_col), key="profile_xtitle")
+                        x_axis_title = st.text_input("X-axis title", value="Time (h)", key="profile_xtitle",
+                                                      help="Edit the unit to match your data, e.g. 'Time (day)'.")
                     with tc3:
                         y_axis_title = st.text_input("Y-axis title", value=f"{conc_col} (ng/mL)", key="profile_ytitle")
 
@@ -759,23 +780,25 @@ else:
                     with ac2:
                         y_interval_linear = st.number_input("Y-axis interval — linear plot only (0 = auto)", min_value=0.0, value=0.0, key="profile_yint")
                     with ac3:
-                        error_metric = st.radio("Error bars", ["SD", "SEM", "None"], horizontal=True, key="profile_error")
+                        error_metric = st.radio("Error bars", ["SD", "None"], horizontal=True, key="profile_error")
 
                 with st.container(border=True):
                     st.markdown("**MEC line (optional)**")
-                    mc1, mc2, mc3 = st.columns(3)
-                    with mc1:
-                        include_mec = st.checkbox("Include MEC line", key="profile_mec_toggle")
+                    include_mec = st.checkbox("Include a minimum effective concentration (MEC) reference line", key="profile_mec_toggle")
                     mec_value, mec_label = None, "MEC"
                     if include_mec:
-                        with mc2:
-                            mec_value = st.number_input("MEC value (ng/mL)", min_value=0.0, value=10.0, key="profile_mec_value")
-                        with mc3:
+                        st.caption("Enter your own MEC value below — it is not calculated from the data.")
+                        mv1, mv2 = st.columns(2)
+                        with mv1:
+                            mec_value = st.number_input("MEC value (ng/mL)", min_value=0.0, value=0.0, step=1.0, key="profile_mec_value")
+                        with mv2:
                             mec_label = st.text_input("MEC line label", value="MEC", key="profile_mec_label")
+                        if mec_value == 0.0:
+                            st.info("Enter your MEC value above to draw the reference line.")
 
                 summary = (
                     profile_df.groupby([group_col, time_col])[conc_col]
-                    .agg(mean="mean", sd="std", sem="sem", n="count")
+                    .agg(mean="mean", sd="std", n="count")
                     .reset_index()
                 )
 
@@ -787,57 +810,118 @@ else:
                         st.warning("Couldn't parse X-axis tick values — using automatic ticks instead.")
                         x_ticks = None
 
+                PLOT_WIDTH, PLOT_HEIGHT = 640, 460
+
                 def build_profile_figure(log_y: bool):
                     fig = go.Figure()
                     for g in profile_groups:
                         g_data = summary[summary[group_col] == g].sort_values(time_col)
-                        err = None
-                        if error_metric == "SD":
-                            err = g_data["sd"].fillna(0)
-                        elif error_metric == "SEM":
-                            err = g_data["sem"].fillna(0)
+                        err = g_data["sd"].fillna(0) if error_metric == "SD" else None
                         fig.add_trace(go.Scatter(
                             x=g_data[time_col], y=g_data["mean"],
                             mode="lines+markers",
                             name=rename_map.get(g, g),
                             line=dict(color=color_map_profile.get(g), width=2.5),
-                            marker=dict(size=8, color=color_map_profile.get(g)),
+                            marker=dict(size=7, color=color_map_profile.get(g)),
                             error_y=dict(type="data", array=err, visible=True) if err is not None else None,
                         ))
 
-                    if include_mec and mec_value is not None:
+                    if include_mec and mec_value:
                         fig.add_hline(y=mec_value, line_dash="dash", line_color="black",
                                       annotation_text=mec_label, annotation_position="top left")
 
                     fig.update_layout(
-                        title=dict(text=plot_title, x=0.5, xanchor="center", font=dict(size=20, family="Arial", color="#1B4965")),
-                        xaxis_title=x_axis_title,
-                        yaxis_title=y_axis_title,
+                        title=dict(text=f"<b>{plot_title}</b>", x=0.5, xanchor="center", font=dict(size=18, family="Arial", color="#1B4965")),
                         template="simple_white",
-                        font=dict(family="Arial", size=14, color="#1F2937"),
-                        legend=dict(bordercolor="lightgray", borderwidth=1, x=1.02, y=1, xanchor="left"),
-                        height=520,
-                        margin=dict(t=80, r=190),
+                        font=dict(family="Arial", size=13, color="#1F2937"),
+                        legend=dict(
+                            bordercolor="lightgray", borderwidth=1, bgcolor="rgba(255,255,255,0.75)",
+                            x=0.99, y=0.99, xanchor="right", yanchor="top",
+                        ),
+                        width=PLOT_WIDTH, height=PLOT_HEIGHT,
+                        margin=dict(t=60, r=25, l=65, b=55),
+                        plot_bgcolor="white", paper_bgcolor="white",
+                    )
+                    axis_title_font = dict(size=14, color="#000000", family="Arial Black, Arial, sans-serif")
+                    fig.update_xaxes(
+                        title=dict(text=f"<b>{x_axis_title}</b>", font=axis_title_font),
+                        showline=True, linewidth=1.2, linecolor="black", mirror=False,
+                        showgrid=True, gridcolor="#E3E8EC", zeroline=False,
                     )
                     if x_ticks:
                         fig.update_xaxes(tickmode="array", tickvals=x_ticks)
-                    fig.update_xaxes(showline=True, linewidth=1, linecolor="black", mirror=True, gridcolor="#E3E8EC")
                     if log_y:
-                        fig.update_yaxes(type="log", showline=True, linewidth=1, linecolor="black", mirror=True, gridcolor="#E3E8EC")
+                        fig.update_yaxes(
+                            title=dict(text=f"<b>{y_axis_title}</b>", font=axis_title_font),
+                            type="log", dtick=1, exponentformat="none",
+                            showline=True, linewidth=1.2, linecolor="black", mirror=False,
+                            showgrid=True, gridcolor="#E3E8EC", zeroline=False,
+                            minor=dict(showgrid=False, ticks=""),
+                        )
                     else:
-                        fig.update_yaxes(showline=True, linewidth=1, linecolor="black", mirror=True, gridcolor="#E3E8EC")
+                        fig.update_yaxes(
+                            title=dict(text=f"<b>{y_axis_title}</b>", font=axis_title_font),
+                            showline=True, linewidth=1.2, linecolor="black", mirror=False,
+                            showgrid=True, gridcolor="#E3E8EC", zeroline=False,
+                        )
                         if y_interval_linear > 0:
                             fig.update_yaxes(dtick=y_interval_linear)
                     return fig
 
+                def render_copyable_plot(fig, height):
+                    """Renders a Plotly figure via plotly.js directly (CDN) with an added
+                    'Copy image to clipboard' button, so the plot can be pasted into slides
+                    or reports without a separate download step. Falls back gracefully if
+                    the browser doesn't support the Clipboard image API."""
+                    fig_json = fig.to_json()
+                    html = f"""
+                    <div id="plotdiv_{id(fig)}"></div>
+                    <div style="margin-top:6px;">
+                      <button id="copybtn_{id(fig)}" style="padding:6px 14px;background:#1B4965;color:#fff;
+                        border:none;border-radius:4px;cursor:pointer;font-family:Arial,sans-serif;font-size:13px;">
+                        Copy image to clipboard
+                      </button>
+                      <span id="copystatus_{id(fig)}" style="margin-left:10px;font-family:Arial,sans-serif;
+                        font-size:13px;color:#5A6B7B;"></span>
+                    </div>
+                    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+                    <script>
+                    (function() {{
+                        var figData = {fig_json};
+                        var gd = document.getElementById('plotdiv_{id(fig)}');
+                        Plotly.newPlot(gd, figData.data, figData.layout, {{displayModeBar: true, responsive: false}});
+                        document.getElementById('copybtn_{id(fig)}').addEventListener('click', function() {{
+                            var statusEl = document.getElementById('copystatus_{id(fig)}');
+                            Plotly.toImage(gd, {{format: 'png', width: figData.layout.width, height: figData.layout.height, scale: 2}})
+                                .then(function(url) {{
+                                    return fetch(url).then(function(res) {{ return res.blob(); }});
+                                }})
+                                .then(function(blob) {{
+                                    if (navigator.clipboard && window.ClipboardItem) {{
+                                        navigator.clipboard.write([new ClipboardItem({{'image/png': blob}})]).then(function() {{
+                                            statusEl.innerText = 'Copied!';
+                                            setTimeout(function() {{ statusEl.innerText = ''; }}, 2000);
+                                        }}).catch(function() {{
+                                            statusEl.innerText = 'Copy not supported in this browser — use the camera icon above to download instead.';
+                                        }});
+                                    }} else {{
+                                        statusEl.innerText = 'Copy not supported in this browser — use the camera icon above to download instead.';
+                                    }}
+                                }});
+                        }});
+                    }})();
+                    </script>
+                    """
+                    components.html(html, height=height + 70, scrolling=False)
+
                 st.subheader("Plot")
                 plot_tab_linear, plot_tab_log = st.tabs(["Linear scale", "Semi-log scale"])
                 with plot_tab_linear:
-                    st.plotly_chart(build_profile_figure(log_y=False), use_container_width=True)
+                    render_copyable_plot(build_profile_figure(log_y=False), PLOT_HEIGHT)
                 with plot_tab_log:
-                    st.plotly_chart(build_profile_figure(log_y=True), use_container_width=True)
+                    render_copyable_plot(build_profile_figure(log_y=True), PLOT_HEIGHT)
 
                 st.caption(
-                    "Tip: hover over a plot and click the camera icon in its top-right toolbar to download it "
-                    "as a high-resolution PNG for slides or reports."
+                    "Click \"Copy image to clipboard\" to paste the plot directly into slides or documents, "
+                    "or use the camera icon in the plot's toolbar to download it as a PNG."
                 )
