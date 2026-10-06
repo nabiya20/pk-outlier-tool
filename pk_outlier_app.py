@@ -30,7 +30,8 @@ from scipy import stats
 import streamlit as st
 import streamlit.components.v1 as components
 from plot_helpers import (PLOT_WIDTH, PLOT_HEIGHT, FONT_FAMILIES, GROUP_COLORS,
-                          style_figure, profile_ranges, distribution_figure)
+                          style_figure, profile_ranges, distribution_figure,
+                          individual_profile_figure, true_log_individual_figure)
 
 st.set_page_config(page_title="PK Outlier & Comparison Tool", layout="wide")
 
@@ -269,7 +270,7 @@ group_col, subj_col, time_col, conc_col = "Group", "Subject", "Time", "Concentra
 # ========================================================================
 
 st.title("PK Outlier & Group Comparison Tool")
-st.caption("Outlier detection, group comparisons, and profile plots for PK study data.")
+st.caption("Outlier detection, group comparisons, and profile plots for PK study data. · Interface v2026.10.06.2")
 
 # ========================================================================
 # Helper: handle a pending file upload with explicit confirmation
@@ -582,19 +583,15 @@ else:
                     params["alpha"] = st.slider("Significance level (alpha)", 0.01, 0.10, 0.05, 0.01, key="alpha_outlier")
                     params["iterative"] = st.checkbox("Remove outliers iteratively", value=True, key="iter_outlier")
 
-        with st.expander("How do the outlier methods differ?", expanded=False):
-            st.markdown("""
-| Method | Simple explanation | What to keep in mind |
-| --- | --- | --- |
-| **IQR** | Flags values outside fences around the middle 50% of values: Q1 − k×IQR to Q3 + k×IQR. | Uses quartiles rather than the mean; this app requires at least 4 values per comparison subset. |
-| **Z-score** | Measures how many standard deviations a value is from the mean. | Extreme values can shift the mean and SD, making other outliers harder to detect. Most meaningful for roughly normal data; at least 3 values here. |
-| **Modified Z-score** | Measures distance from the median using the median absolute deviation (MAD). | Less affected by extremes. This implementation gives zero scores if MAD is zero; at least 3 values here. |
-| **Grubbs' test** | Tests whether the most extreme value is unusually far from the mean at the selected significance level. | Assumes approximately normal data; at least 3 values. Iterative mode repeats after temporarily removing a flagged value from the test subset. |
-
-A higher IQR/Z-score threshold flags fewer values; a lower Grubbs alpha is more stringent. Iterative Grubbs testing does not guarantee an overall false-positive rate equal to alpha. Small subsets limit detection. Flags identify unusual observations; they do not automatically delete your data.
-
-For PK profiles, **Group + Time point** compares subjects at the same time within the same group. Pooling different times or treatment groups can flag expected PK differences.
-""")
+        with st.expander("How does this method flag outliers?", expanded=False):
+            method_help = {
+                "IQR": "Flags values much higher or lower than the typical middle range of the comparison group. It is less influenced by extreme values than methods based on the mean.",
+                "Z-score": "Flags values far from the group average relative to its usual variation. A higher threshold means a value must be further from the average to be flagged.",
+                "Modified Z-score": "Flags values far from the group median (middle value), using a measure of typical variation that is less affected by extreme values.",
+                "Grubbs' test": "Checks whether the most extreme value is unusually far from the group average for roughly normal data. Iterative mode repeats the check after each flag.",
+            }
+            st.markdown(f"**{method}:** {method_help[method]}")
+            st.caption("Flags highlight unusual observations; they do not remove your data.")
 
         if grouping_choice.startswith("Group + Time"):
             group_cols = [group_col, time_col]
@@ -977,15 +974,42 @@ For PK profiles, **Group + Time point** compares subjects at the same time withi
                     return fig
 
                 st.subheader("Plot")
-                plot_tab_linear, plot_tab_log = st.tabs(["Linear scale", "Semi-log scale"])
+                plot_tab_linear, plot_tab_log, plot_tab_individual = st.tabs(["Mean — linear", "Mean — semi-log", "Individual profiles"])
                 with plot_tab_linear:
                     render_copyable_plot(build_profile_figure(log_y=False), PLOT_HEIGHT)
                 with plot_tab_log:
                     if (summary["mean"] > 0).any():
                         render_copyable_plot(build_profile_figure(log_y=True), PLOT_HEIGHT)
-                        st.caption("Semi-log: X starts at zero. The Y-axis starts at a positive power of ten because log(0) is undefined. Nonpositive means and SD portions below the displayed minimum are not shown; data and statistics remain unchanged.")
+                        st.caption("True semi-log: zero cannot be shown on Y. Nonpositive means are omitted; lower SD bars are clipped at the positive display minimum.")
                     else:
-                        st.info("The semi-log plot needs at least one positive mean concentration.")
+                        st.info("The true semi-log plot needs at least one positive mean concentration.")
+
+                with plot_tab_individual:
+                    indiv_group_options = [g for g in profile_groups if (profile_df[group_col] == g).any()]
+                    individual_group = st.selectbox("Group for individual profiles", indiv_group_options,
+                        format_func=lambda g: str(rename_map.get(g, g)), key="individual_group")
+                    subject_options = sorted(profile_df.loc[profile_df[group_col] == individual_group, subj_col].unique().tolist())
+                    individual_subjects = st.multiselect("Subjects to display", subject_options, default=subject_options,
+                        key=f"individual_subjects_{individual_group}")
+                    indiv_scale = st.radio("Individual profile scale", ["Linear", "Semi-log"],
+                        horizontal=True, key="individual_scale")
+                    if individual_subjects:
+                        individual_fig = individual_profile_figure(profile_df, individual_group, individual_subjects,
+                            plot_font, x_axis_title, y_axis_title,
+                            f"{plot_title} — {rename_map.get(individual_group, individual_group)} — individuals")
+                        if x_ticks:
+                            individual_fig.update_xaxes(tickmode="array", tickvals=x_ticks)
+                        if indiv_scale == "Semi-log":
+                            individual_fig = true_log_individual_figure(individual_fig)
+                        elif y_interval_linear > 0:
+                            individual_fig.update_yaxes(dtick=y_interval_linear)
+                        if individual_fig is not None:
+                            render_copyable_plot(individual_fig, PLOT_HEIGHT)
+                            st.caption("One line per subject in the selected group; original observations, no averaging or SD bars. Click a legend entry to hide/show a subject.")
+                        else:
+                            st.info("The true semi-log plot needs at least one positive concentration.")
+                    else:
+                        st.info("Select at least one subject to display individual profiles.")
 
                 st.caption(
                     "Click \"Copy image to clipboard\" to paste the plot directly into slides or documents, "

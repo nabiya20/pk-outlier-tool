@@ -73,3 +73,44 @@ def distribution_figure(df, groups, times, grouped, colors, font, x_title, y_tit
     fig.update_xaxes(type="category", categoryorder="array", categoryarray=labels,
                      tickangle=-45 if len(labels) > 8 else 0)
     return fig
+
+
+def individual_profile_figure(df, group, subjects, font, x_title, y_title, title):
+    """One original time/concentration series per subject within a group."""
+    fig = go.Figure()
+    group_data = df[(df["Group"] == group) & df["Subject"].isin(subjects)]
+    for i, subject in enumerate(subjects):
+        rows = group_data[group_data["Subject"] == subject].sort_values("Time", kind="stable")
+        if rows.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=rows["Time"], y=rows["Concentration"], mode="lines+markers", name=str(subject),
+            line=dict(color=GROUP_COLORS[i % len(GROUP_COLORS)], width=1.5,
+                      dash=["solid", "dash", "dot"][i // len(GROUP_COLORS) % 3]),
+            marker=dict(size=5),
+            hovertemplate=f"{x_title}: %{{x}}<br>{y_title}: %{{y:.4g}}<extra>%{{fullData.name}}</extra>",
+        ))
+    style_figure(fig, font, x_title, y_title)
+    fig.update_layout(title=dict(text=title, x=0.5, xanchor="center"),
+                      legend=dict(orientation="v", x=1.02, y=1, xanchor="left", yanchor="top"),
+                      margin=dict(t=65, r=140, l=75, b=65))
+    xmax = max(float(group_data["Time"].max()), 0) if len(group_data) else 0
+    ymax = max(float(group_data["Concentration"].max()), 0) if len(group_data) else 0
+    fig.update_xaxes(range=[0, xmax * 1.04 if xmax else 1], autorange=False)
+    fig.update_yaxes(range=[0, ymax * 1.12 if ymax else 1], autorange=False)
+    return fig
+
+
+def true_log_individual_figure(source):
+    fig = go.Figure(source)
+    positive = []
+    for trace in fig.data:
+        values = np.asarray(trace.y, dtype=float)
+        positive.extend(values[np.isfinite(values) & (values > 0)].tolist())
+        trace.y = np.where(values > 0, values, np.nan)
+    if not positive:
+        return None
+    low = math.floor(math.log10(min(positive)))
+    high = max(math.ceil(math.log10(max(positive))), low + 1)
+    fig.update_yaxes(type="log", range=[low, high], tickmode="auto", dtick=1, exponentformat="none")
+    return fig
