@@ -31,7 +31,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from plot_helpers import (PLOT_WIDTH, PLOT_HEIGHT, FONT_FAMILIES, GROUP_COLORS,
                           style_figure, profile_ranges, distribution_figure,
-                          individual_profile_figure, true_log_individual_figure)
+                          individual_profile_figure, profile_style)
 
 st.set_page_config(page_title="PK Outlier & Comparison Tool", layout="wide")
 
@@ -270,7 +270,7 @@ group_col, subj_col, time_col, conc_col = "Group", "Subject", "Time", "Concentra
 # ========================================================================
 
 st.title("PK Outlier & Group Comparison Tool")
-st.caption("Outlier detection, group comparisons, and profile plots for PK study data. · Interface v2026.10.06.2")
+st.caption("Outlier detection, group comparisons, and profile plots for PK study data. · Interface v2026.10.06.3")
 
 # ========================================================================
 # Helper: handle a pending file upload with explicit confirmation
@@ -825,6 +825,27 @@ else:
                     "Subjects to exclude from this plot only", profile_subjects_all, default=[], key="profile_exclude_subj"
                 )
 
+            profile_flags = result[result["Is_Outlier"]].copy()
+            st.caption(f"Outlier reference: {method} ({param_label}) · {scope_label}. Flags use all analysis data, before plot exclusions.")
+            with st.expander(f"Flagged groups & subjects ({len(profile_flags)} observations)", expanded=False):
+                if profile_flags.empty:
+                    st.success("No observations flagged with the current outlier settings.")
+                else:
+                    flag_rows = []
+                    for (flag_group, flag_subject), flagged_samples in profile_flags.groupby([group_col, subj_col]):
+                        if flag_group not in profile_groups:
+                            plot_status = "Group not included"
+                        elif flag_subject in excluded_profile_subjects:
+                            plot_status = "Subject excluded"
+                        else:
+                            plot_status = "Included in plot"
+                        flag_rows.append({"Group": flag_group, "Subject": flag_subject,
+                                          "Flagged points": len(flagged_samples),
+                                          f"Flagged times ({time_unit})": ", ".join(f"{t:g}" for t in sorted(flagged_samples[time_col].unique())),
+                                          "Plot status": plot_status})
+                    st.dataframe(pd.DataFrame(flag_rows), hide_index=True, width="stretch", height=180)
+                    st.caption("A flagged point does not mean the whole subject is invalid. Excluding a subject removes that subject's entire curve from the plots only.")
+
         if not profile_groups:
             st.info("Select at least one group above to build a plot.")
         else:
@@ -933,18 +954,7 @@ else:
                         fig.add_hline(y=mec_value, line_dash="dash", line_color="black",
                                       annotation_text=mec_label, annotation_position="top left")
 
-                    fig.update_layout(
-                        title=dict(text=f"<b>{plot_title}</b>", x=0.5, xanchor="center", font=dict(size=18, family=plot_font, color="#1B4965")),
-                        template="simple_white",
-                        font=dict(family=plot_font, size=13, color="#1F2937"),
-                        legend=dict(
-                            bordercolor="lightgray", borderwidth=1, bgcolor="rgba(255,255,255,0.75)",
-                            x=0.99, y=0.99, xanchor="right", yanchor="top",
-                        ),
-                        width=PLOT_WIDTH, height=PLOT_HEIGHT,
-                        margin=dict(t=60, r=25, l=65, b=55),
-                        plot_bgcolor="white", paper_bgcolor="white",
-                    )
+                    profile_style(fig, plot_font, x_axis_title, y_axis_title, plot_title)
                     axis_title_font = dict(size=14, color="#000000", family=plot_font)
                     fig.update_xaxes(
                         title=dict(text=f"<b>{x_axis_title}</b>", font=axis_title_font),
@@ -991,23 +1001,19 @@ else:
                     subject_options = sorted(profile_df.loc[profile_df[group_col] == individual_group, subj_col].unique().tolist())
                     individual_subjects = st.multiselect("Subjects to display", subject_options, default=subject_options,
                         key=f"individual_subjects_{individual_group}")
-                    indiv_scale = st.radio("Individual profile scale", ["Linear", "Semi-log"],
-                        horizontal=True, key="individual_scale")
+                    individual_title = st.text_input("Individual plot title", value="PK Profile", key="individual_title",
+                        help="Edit the complete title, or leave it blank to hide the title. No group or individual suffix is added.")
                     if individual_subjects:
                         individual_fig = individual_profile_figure(profile_df, individual_group, individual_subjects,
                             plot_font, x_axis_title, y_axis_title,
-                            f"{plot_title} — {rename_map.get(individual_group, individual_group)} — individuals")
+                            individual_title, base_color=color_map_profile[individual_group],
+                            color_subjects=sorted(df.loc[df[group_col] == individual_group, subj_col].unique().tolist()))
                         if x_ticks:
                             individual_fig.update_xaxes(tickmode="array", tickvals=x_ticks)
-                        if indiv_scale == "Semi-log":
-                            individual_fig = true_log_individual_figure(individual_fig)
-                        elif y_interval_linear > 0:
+                        if y_interval_linear > 0:
                             individual_fig.update_yaxes(dtick=y_interval_linear)
-                        if individual_fig is not None:
-                            render_copyable_plot(individual_fig, PLOT_HEIGHT)
-                            st.caption("One line per subject in the selected group; original observations, no averaging or SD bars. Click a legend entry to hide/show a subject.")
-                        else:
-                            st.info("The true semi-log plot needs at least one positive concentration.")
+                        render_copyable_plot(individual_fig, PLOT_HEIGHT)
+                        st.caption("One line per subject in the selected group; shades follow the group's mean color. Original observations, no averaging or SD bars. Click a legend entry to hide/show a subject.")
                     else:
                         st.info("Select at least one subject to display individual profiles.")
 

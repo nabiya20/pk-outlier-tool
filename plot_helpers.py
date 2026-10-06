@@ -1,5 +1,6 @@
 """Presentation-only helpers. Never changes analytical input or results."""
 import math
+import colorsys
 import numpy as np
 import plotly.graph_objects as go
 
@@ -75,42 +76,60 @@ def distribution_figure(df, groups, times, grouped, colors, font, x_title, y_tit
     return fig
 
 
-def individual_profile_figure(df, group, subjects, font, x_title, y_title, title):
-    """One original time/concentration series per subject within a group."""
+
+def profile_style(fig, font, x_title, y_title, title):
+    """Shared presentation for mean and individual PK profiles."""
+    style_figure(fig, font, x_title, y_title)
+    fig.update_layout(
+        title=dict(text=f"<b>{title}</b>" if title else "", x=0.5, xanchor="center",
+                   font=dict(size=18, family=font, color="#1B4965")),
+        legend=dict(orientation="v", bordercolor="lightgray", borderwidth=1,
+                    bgcolor="rgba(255,255,255,0.75)", x=0.99, y=0.99,
+                    xanchor="right", yanchor="top"),
+        margin=dict(t=60, r=25, l=65, b=55),
+    )
+    fig.update_xaxes(title_text=f"<b>{x_title}</b>")
+    fig.update_yaxes(title_text=f"<b>{y_title}</b>")
+    return fig
+
+
+def subject_shades(base_color, subjects):
+    """Stable lightness variants of a group's selected mean color."""
+    rgb = tuple(int(base_color[i:i+2], 16) / 255 for i in (1,3,5))
+    hue, lightness, saturation = colorsys.rgb_to_hls(*rgb)
+    if len(subjects) <= 1:
+        return {s: base_color for s in subjects}
+    low = lightness if saturation < 0.08 else max(0.16, min(lightness * 0.6, 0.45))
+    high = min(0.78, max(lightness + 0.23, 0.70))
+    shades = {}
+    for subject, level in zip(subjects, np.linspace(low, high, len(subjects))):
+        color = colorsys.hls_to_rgb(hue, level, saturation)
+        shades[subject] = "#" + "".join(f"{round(c*255):02x}" for c in color)
+    return shades
+
+
+def individual_profile_figure(df, group, subjects, font, x_title, y_title, title,
+                              base_color=GROUP_COLORS[0], color_subjects=None):
+    """One unchanged original series per subject, styled like the mean plot."""
     fig = go.Figure()
     group_data = df[(df["Group"] == group) & df["Subject"].isin(subjects)]
-    for i, subject in enumerate(subjects):
+    all_subjects = list(color_subjects) if color_subjects is not None else sorted(df.loc[df["Group"] == group, "Subject"].unique())
+    shades = subject_shades(base_color, all_subjects)
+    for subject in subjects:
         rows = group_data[group_data["Subject"] == subject].sort_values("Time", kind="stable")
         if rows.empty:
             continue
+        subject_index = all_subjects.index(subject)
         fig.add_trace(go.Scatter(
             x=rows["Time"], y=rows["Concentration"], mode="lines+markers", name=str(subject),
-            line=dict(color=GROUP_COLORS[i % len(GROUP_COLORS)], width=1.5,
-                      dash=["solid", "dash", "dot"][i // len(GROUP_COLORS) % 3]),
-            marker=dict(size=5),
+            line=dict(color=shades[subject], width=2.5,
+                      dash=["solid", "dash", "dot"][subject_index // 8 % 3]),
+            marker=dict(size=7, color=shades[subject]),
             hovertemplate=f"{x_title}: %{{x}}<br>{y_title}: %{{y:.4g}}<extra>%{{fullData.name}}</extra>",
         ))
-    style_figure(fig, font, x_title, y_title)
-    fig.update_layout(title=dict(text=title, x=0.5, xanchor="center"),
-                      legend=dict(orientation="v", x=1.02, y=1, xanchor="left", yanchor="top"),
-                      margin=dict(t=65, r=140, l=75, b=65))
+    profile_style(fig, font, x_title, y_title, title)
     xmax = max(float(group_data["Time"].max()), 0) if len(group_data) else 0
     ymax = max(float(group_data["Concentration"].max()), 0) if len(group_data) else 0
     fig.update_xaxes(range=[0, xmax * 1.04 if xmax else 1], autorange=False)
     fig.update_yaxes(range=[0, ymax * 1.12 if ymax else 1], autorange=False)
-    return fig
-
-
-def true_log_individual_figure(source):
-    fig = go.Figure(source)
-    positive = []
-    for trace in fig.data:
-        values = np.asarray(trace.y, dtype=float)
-        positive.extend(values[np.isfinite(values) & (values > 0)].tolist())
-        trace.y = np.where(values > 0, values, np.nan)
-    if not positive:
-        return None
-    low = math.floor(math.log10(min(positive)))
-    high = max(math.ceil(math.log10(max(positive))), low + 1)
-    fig.update_yaxes(type="log", range=[low, high], tickmode="auto", dtick=1, exponentformat="none")
     return fig
